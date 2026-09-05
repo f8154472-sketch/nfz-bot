@@ -1,9 +1,11 @@
 import os
+import json
+import random
 import logging
 import aiohttp
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.error import BadRequest
 
 load_dotenv()
@@ -13,6 +15,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", 300))
+ADMIN_ID = os.getenv("ADMIN_ID", "")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "")
+
+DATA_FILE = "data.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,6 +26,18 @@ logging.basicConfig(
     handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    return {"referrals": {}, "game_wins": {}}
+
+
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f)
 
 
 def escape_markdown(text: str) -> str:
@@ -34,7 +52,6 @@ async def fetch_json(session, url, params=None):
     try:
         async with session.get(url, params=params, timeout=timeout) as resp:
             if resp.status == 429:
-                logger.warning("Rate limit")
                 return None
             resp.raise_for_status()
             return await resp.json()
@@ -59,12 +76,8 @@ async def get_holders_count(session):
         return "N/A"
     url = "https://api.etherscan.io/v2/api"
     params = {
-        "chainid": 56,
-        "module": "token",
-        "action": "tokenholderlist",
-        "contractaddress": TOKEN_ADDRESS,
-        "page": 1,
-        "offset": 100,
+        "chainid": 56, "module": "token", "action": "tokenholderlist",
+        "contractaddress": TOKEN_ADDRESS, "page": 1, "offset": 100,
         "apikey": BSCSCAN_API_KEY,
     }
     data = await fetch_json(session, url, params)
@@ -83,7 +96,6 @@ async def build_message(session, pair):
         symbol = escape_markdown(pair.get("baseToken", {}).get("symbol", "TOKEN"))
         trend = "📈" if float(change) >= 0 else "📉"
         holders = await get_holders_count(session)
-
         return (
             f"*{symbol} Price Update*\n\n"
             f"💰 Price: *${price:.8f}*\n"
@@ -104,13 +116,33 @@ def main_keyboard():
             InlineKeyboardButton("📊 Price", callback_data="cmd:price"),
             InlineKeyboardButton("👥 Holders", callback_data="cmd:holders"),
         ],
+        [
+            InlineKeyboardButton("🎮 Играть", callback_data="cmd:play"),
+            InlineKeyboardButton("👥 Реферал", callback_data="cmd:ref"),
+        ],
         [InlineKeyboardButton("🔗 DexScreener", url=f"https://dexscreener.com/bsc/{TOKEN_ADDRESS}")],
-    ])
+    ])async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    data = load_data()
 
+    if context.args:
+        ref_id = context.args[0]
+        if ref_id != user_id and user_id not in data["referrals"]:
+            data["referrals"].setdefault(ref_id, {"count": 0, "invited": []})
+            if user_id not in data["referrals"][ref_id]["invited"]:
+                data["referrals"][ref_id]["invited"].append(user_id)
+                data["referrals"][ref_id]["count"] += 1
+                save_data(data)
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(ref_id),
+                        text="🎉 По вашей ссылке зарегистрировался новый пользователь!"
+                    )
+                except Exception:
+                    pass
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*Token Tracker*\n\nReal-time price & holder updates.",
+        "*NFZ Token Bot*\n\nЦена, держатели, игра и рефералы.",
         parse_mode="Markdown", reply_markup=main_keyboard(),
     )
 
@@ -132,13 +164,86 @@ async def holders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"👥 *Holders:* {count}", parse_mode="Markdown")
 
 
+async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["game_number"] = random.randint(1, 10)
+    await update.message.reply_text(
+        "🎮 Я загадал число от 1 до 10!\nНапишите число в чат, чтобы угадать."
+    )
+
+
+async def guess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "game_number" not in context.user_data:
+        return
+    text = update.message.text.strip()
+    if not text.isdigit():
+        return
+    guess = int(text)
+    target = context.user_data["game_number"]
+
+    if guess == target:
+        user_id = str(update.effective_user.id)
+        username = update.effective_user.username or update.effective_user.first_name
+        data = load_data()
+        data["game_wins"].setdefault(user_id, {"wins": 0, "username": username})
+        data["game_wins"][user_id]["wins"] += 1
+        save_data(data)
+        del context.user_data["game_number"]
+
+        await update.message.reply_text(
+            f"🎉 Угадали! Число было {target}.\n"
+            f"Приз будет отправлен вручную администратором."
+        )
+        if ADMIN_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(ADMIN_ID),
+                    text=f"🏆 Победитель игры: @{username} (id: {user_id})\nОтправьте приз вручную."
+                )
+            except Exception:
+                pass
+    elif guess < target:
+        await update.message.reply_text("📈 Больше!")
+    else:
+        await update.message.reply_text("📉 Меньше!")async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    bot_username = (await context.bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start={user_id}"
+    data = load_data()
+    count = data["referrals"].get(user_id, {}).get("count", 0)
+    await update.message.reply_text(
+        f"👥 *Ваша реферальная ссылка:*\n{link}\n\n"
+        f"Приглашено друзей: *{count}*\n"
+        f"За каждого друга — бонус в NFZ (отправляется вручную).",
+        parse_mode="Markdown",
+    )
+
+
+async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ Эта команда доступна только администратору.")
+        return
+    if not CHANNEL_ID:
+        await update.message.reply_text("❌ CHANNEL_ID не настроен.")
+        return
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("Использование: /post ваш текст сообщения")
+        return
+    try:
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=text)
+        await update.message.reply_text("✅ Опубликовано в канале.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+    data_cb = query.data
     session = context.application.bot_data["session"]
 
-    if data == "cmd:price":
+    if data_cb == "cmd:price":
         pair = await fetch_dex_data(session)
         if pair:
             msg = await build_message(session, pair)
@@ -152,7 +257,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         await query.edit_message_text("❌ Токен не найден", reply_markup=main_keyboard())
 
-    elif data == "cmd:holders":
+    elif data_cb == "cmd:holders":
         count = await get_holders_count(session)
         try:
             await query.edit_message_text(f"👥 *Holders:* {count}",
@@ -160,6 +265,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except BadRequest as e:
             if "Message is not modified" not in str(e):
                 raise
+
+    elif data_cb == "cmd:play":
+        context.user_data["game_number"] = random.randint(1, 10)
+        await query.message.reply_text("🎮 Я загадал число от 1 до 10!\nНапишите число в чат.")
+
+    elif data_cb == "cmd:ref":
+        user_id = str(query.from_user.id)
+        bot_username = (await context.bot.get_me()).username
+        link = f"https://t.me/{bot_username}?start={user_id}"
+        data_store = load_data()
+        count = data_store["referrals"].get(user_id, {}).get("count", 0)
+        await query.message.reply_text(
+            f"👥 *Ваша реферальная ссылка:*\n{link}\n\nПриглашено: *{count}*",
+            parse_mode="Markdown",
+        )
 
 
 async def periodic_update(context: ContextTypes.DEFAULT_TYPE):
@@ -173,7 +293,6 @@ async def periodic_update(context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg,
             parse_mode="Markdown", disable_web_page_preview=True)
-        logger.info("Обновление отправлено")
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
 
@@ -199,7 +318,11 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price_command))
     app.add_handler(CommandHandler("holders", holders_command))
+    app.add_handler(CommandHandler("play", play_command))
+    app.add_handler(CommandHandler("ref", ref_command))
+    app.add_handler(CommandHandler("post", post_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guess_handler))
 
     if app.job_queue:
         app.job_queue.run_repeating(periodic_update, interval=UPDATE_INTERVAL, first=10)
