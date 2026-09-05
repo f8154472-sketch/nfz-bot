@@ -121,7 +121,7 @@ def main_keyboard():
             InlineKeyboardButton("👥 Реферал", callback_data="cmd:ref"),
         ],
         [InlineKeyboardButton("🔗 DexScreener", url=f"https://dexscreener.com/bsc/{TOKEN_ADDRESS}")],
-    ])async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ]   )async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     data = load_data()
 
