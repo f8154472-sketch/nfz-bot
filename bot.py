@@ -18,6 +18,11 @@ UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", 300))
 ADMIN_ID = os.getenv("ADMIN_ID", "")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 
+WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "")
+BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed.binance.org/")
+GAME_PRIZE_AMOUNT = os.getenv("GAME_PRIZE_AMOUNT", "5000000000")
+REFERRAL_PRIZE_AMOUNT = os.getenv("REFERRAL_PRIZE_AMOUNT", "2000000000")
+
 DATA_FILE = "data.json"
 
 logging.basicConfig(
@@ -27,12 +32,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+w3 = None
+sender_account = None
+AUTO_SEND_ENABLED = False
+
+if WALLET_PRIVATE_KEY:
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL))
+        sender_account = w3.eth.account.from_key(WALLET_PRIVATE_KEY)
+        AUTO_SEND_ENABLED = True
+        logger.info("Automatic prize sending is ENABLED")
+    except Exception as e:
+        logger.error(f"Failed to set up web3 auto-send: {e}")
+        AUTO_SEND_ENABLED = False
+else:
+    logger.info("WALLET_PRIVATE_KEY not set. Manual mode.")
+
+ERC20_ABI = [
+    {
+        "constant": False,
+        "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}],
+        "name": "transfer",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "type": "function",
+    },
+]
+
 
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             return json.load(f)
-    return {"referrals": {}, "game_wins": {}}
+    return {"referrals": {}, "game_wins": {}, "wallets": {}}
 
 
 def save_data(data):
@@ -94,34 +133,58 @@ async def build_message(session, pair):
         volume = pair.get("volume", {}).get("h24", 0) or 0
         liquidity = pair.get("liquidity", {}).get("usd", 0) or 0
         symbol = escape_markdown(pair.get("baseToken", {}).get("symbol", "TOKEN"))
-        trend = "📈" if float(change) >= 0 else "📉"
+        trend = "\U0001F4C8" if float(change) >= 0 else "\U0001F4C9"
         holders = await get_holders_count(session)
         return (
             f"*{symbol} Price Update*\n\n"
-            f"💰 Price: *${price:.8f}*\n"
+            f"Price: *${price:.8f}*\n"
             f"{trend} 24h: *{float(change):.2f}%*\n"
-            f"🔄 Volume: *${volume:,.0f}*\n"
-            f"💧 Liquidity: *${liquidity:,.0f}*\n"
-            f"👥 Holders: *{holders}*\n\n"
-            f"🔗 [DexScreener]({pair.get('url', '')})"
+            f"Volume: *${volume:,.0f}*\n"
+            f"Liquidity: *${liquidity:,.0f}*\n"
+            f"Holders: *{holders}*\n\n"
+            f"[DexScreener]({pair.get('url', '')})"
         )
     except Exception as e:
-        logger.error(f"Ошибка сборки: {e}")
+        logger.error(f"Message build error: {e}")
         return None
 
 
 def main_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📊 Price", callback_data="cmd:price"),
-            InlineKeyboardButton("👥 Holders", callback_data="cmd:holders"),
+            InlineKeyboardButton("Price", callback_data="cmd:price"),
+            InlineKeyboardButton("Holders", callback_data="cmd:holders"),
         ],
         [
-            InlineKeyboardButton("🎮 Играть", callback_data="cmd:play"),
-            InlineKeyboardButton("👥 Реферал", callback_data="cmd:ref"),
+            InlineKeyboardButton("Play", callback_data="cmd:play"),
+            InlineKeyboardButton("Referral", callback_data="cmd:ref"),
         ],
-        [InlineKeyboardButton("🔗 DexScreener", url=f"https://dexscreener.com/bsc/{TOKEN_ADDRESS}")],
-    ]   )async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        [InlineKeyboardButton("DexScreener", url=f"https://dexscreener.com/bsc/{TOKEN_ADDRESS}")],
+    ])
+
+
+def send_token_reward(to_address: str, amount_tokens: int) -> tuple:
+    if not AUTO_SEND_ENABLED:
+        return False, "Automatic sending is not configured."
+    try:
+        contract = w3.eth.contract(address=Web3.to_checksum_address(TOKEN_ADDRESS), abi=ERC20_ABI)
+        decimals = contract.functions.decimals().call()
+        amount_wei = int(amount_tokens * (10 ** decimals))
+        nonce = w3.eth.get_transaction_count(sender_account.address)
+        txn = contract.functions.transfer(
+            Web3.to_checksum_address(to_address), amount_wei
+        ).build_transaction({
+            "chainId": 56,
+            "gas": 100000,
+            "gasPrice": w3.eth.gas_price,
+            "nonce": nonce,
+        })
+        signed_txn = w3.eth.account.sign_transaction(txn, private_key=WALLET_PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+        return True, tx_hash.hex()
+    except Exception as e:
+        logger.error(f"Token send error: {e}")
+        return False, str(e)async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     data = load_data()
 
@@ -136,15 +199,34 @@ def main_keyboard():
                 try:
                     await context.bot.send_message(
                         chat_id=int(ref_id),
-                        text="🎉 По вашей ссылке зарегистрировался новый пользователь!"
+                        text="A new user joined using your referral link! Use /wallet to set your BSC address."
                     )
                 except Exception:
                     pass
 
     await update.message.reply_text(
-        "*NFZ Token Bot*\n\nЦена, держатели, игра и рефералы.",
+        "*NFZ Token Bot*\n\nPrice, holders, game and referrals.\n"
+        "Use /wallet YOUR_BSC_ADDRESS to register where prizes should be sent.",
         parse_mode="Markdown", reply_markup=main_keyboard(),
     )
+
+
+async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /wallet 0xYourBscAddress\nThis is where your prizes will be sent."
+        )
+        return
+    address = context.args[0]
+    if not address.startswith("0x") or len(address) != 42:
+        await update.message.reply_text("Invalid address format.")
+        return
+    data = load_data()
+    data.setdefault("wallets", {})
+    data["wallets"][user_id] = address
+    save_data(data)
+    await update.message.reply_text(f"Wallet saved: {address}")
 
 
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -155,20 +237,18 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if msg:
             await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
             return
-    await update.message.reply_text("❌ Токен не найден на DexScreener")
+    await update.message.reply_text("Token not found on DexScreener")
 
 
 async def holders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = context.application.bot_data["session"]
     count = await get_holders_count(session)
-    await update.message.reply_text(f"👥 *Holders:* {count}", parse_mode="Markdown")
+    await update.message.reply_text(f"Holders: *{count}*", parse_mode="Markdown")
 
 
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["game_number"] = random.randint(1, 10)
-    await update.message.reply_text(
-        "🎮 Я загадал число от 1 до 10!\nНапишите число в чат, чтобы угадать."
-    )
+    await update.message.reply_text("I picked a number from 1 to 10! Type a number to guess.")
 
 
 async def guess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -189,31 +269,54 @@ async def guess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
         del context.user_data["game_number"]
 
-        await update.message.reply_text(
-            f"🎉 Угадали! Число было {target}.\n"
-            f"Приз будет отправлен вручную администратором."
-        )
-        if ADMIN_ID:
-            try:
-                await context.bot.send_message(
-                    chat_id=int(ADMIN_ID),
-                    text=f"🏆 Победитель игры: @{username} (id: {user_id})\nОтправьте приз вручную."
+        wallet = data.get("wallets", {}).get(user_id)
+
+        if AUTO_SEND_ENABLED and wallet:
+            amount = int(GAME_PRIZE_AMOUNT)
+            success, result = send_token_reward(wallet, amount)
+            if success:
+                await update.message.reply_text(
+                    f"You guessed it! Number was {target}.\n{amount:,} NFZ sent!\nTx: {result}"
                 )
-            except Exception:
-                pass
+            else:
+                await update.message.reply_text(
+                    f"You guessed it! Number was {target}.\nAuto-send failed. Admin will send manually."
+                )
+                if ADMIN_ID:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(ADMIN_ID),
+                            text=f"AUTO-SEND FAILED for @{username} ({user_id}), wallet: {wallet}"
+                        )
+                    except Exception:
+                        pass
+        else:
+            await update.message.reply_text(
+                f"You guessed it! Number was {target}.\nPrize sent manually by admin."
+                + ("" if wallet else "\nSet your wallet with /wallet 0xYourAddress")
+            )
+            if ADMIN_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(ADMIN_ID),
+                        text=f"Game winner: @{username} ({user_id}), wallet: {wallet or 'NOT SET'}"
+                    )
+                except Exception:
+                    pass
     elif guess < target:
-        await update.message.reply_text("📈 Больше!")
+        await update.message.reply_text("Higher!")
     else:
-        await update.message.reply_text("📉 Меньше!")async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("Lower!")
+
+
+async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     bot_username = (await context.bot.get_me()).username
     link = f"https://t.me/{bot_username}?start={user_id}"
     data = load_data()
     count = data["referrals"].get(user_id, {}).get("count", 0)
     await update.message.reply_text(
-        f"👥 *Ваша реферальная ссылка:*\n{link}\n\n"
-        f"Приглашено друзей: *{count}*\n"
-        f"За каждого друга — бонус в NFZ (отправляется вручную).",
+        f"Your referral link:\n{link}\n\nInvited: *{count}*\nRegister wallet with /wallet 0xAddress",
         parse_mode="Markdown",
     )
 
@@ -221,20 +324,20 @@ async def guess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ Эта команда доступна только администратору.")
+        await update.message.reply_text("Admin only command.")
         return
     if not CHANNEL_ID:
-        await update.message.reply_text("❌ CHANNEL_ID не настроен.")
+        await update.message.reply_text("CHANNEL_ID not set.")
         return
     text = " ".join(context.args)
     if not text:
-        await update.message.reply_text("Использование: /post ваш текст сообщения")
+        await update.message.reply_text("Usage: /post your text")
         return
     try:
         await context.bot.send_message(chat_id=CHANNEL_ID, text=text)
-        await update.message.reply_text("✅ Опубликовано в канале.")
+        await update.message.reply_text("Posted.")
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        await update.message.reply_text(f"Error: {e}")
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -255,12 +358,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if "Message is not modified" not in str(e):
                         raise
                 return
-        await query.edit_message_text("❌ Токен не найден", reply_markup=main_keyboard())
+        await query.edit_message_text("Token not found", reply_markup=main_keyboard())
 
     elif data_cb == "cmd:holders":
         count = await get_holders_count(session)
         try:
-            await query.edit_message_text(f"👥 *Holders:* {count}",
+            await query.edit_message_text(f"Holders: *{count}*",
                 parse_mode="Markdown", reply_markup=main_keyboard())
         except BadRequest as e:
             if "Message is not modified" not in str(e):
@@ -268,7 +371,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data_cb == "cmd:play":
         context.user_data["game_number"] = random.randint(1, 10)
-        await query.message.reply_text("🎮 Я загадал число от 1 до 10!\nНапишите число в чат.")
+        await query.message.reply_text("I picked a number from 1 to 10! Type a number.")
 
     elif data_cb == "cmd:ref":
         user_id = str(query.from_user.id)
@@ -276,10 +379,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         link = f"https://t.me/{bot_username}?start={user_id}"
         data_store = load_data()
         count = data_store["referrals"].get(user_id, {}).get("count", 0)
-        await query.message.reply_text(
-            f"👥 *Ваша реферальная ссылка:*\n{link}\n\nПриглашено: *{count}*",
-            parse_mode="Markdown",
-        )
+        await query.message.reply_text(f"Your link:\n{link}\n\nInvited: *{count}*", parse_mode="Markdown")
 
 
 async def periodic_update(context: ContextTypes.DEFAULT_TYPE):
@@ -294,7 +394,7 @@ async def periodic_update(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg,
             parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
+        logger.error(f"Send error: {e}")
 
 
 async def post_init(app: Application):
@@ -316,6 +416,7 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("wallet", wallet_command))
     app.add_handler(CommandHandler("price", price_command))
     app.add_handler(CommandHandler("holders", holders_command))
     app.add_handler(CommandHandler("play", play_command))
@@ -327,7 +428,7 @@ def main():
     if app.job_queue:
         app.job_queue.run_repeating(periodic_update, interval=UPDATE_INTERVAL, first=10)
 
-    logger.info("Бот запущен")
+    logger.info("Bot started")
     app.run_polling()
 
 
