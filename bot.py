@@ -18,10 +18,11 @@ UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", 300))
 ADMIN_ID = os.getenv("ADMIN_ID", "")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 
+# Optional: automatic prize sending (only works if these are set in Railway Variables)
 WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "")
 BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed.binance.org/")
-GAME_PRIZE_AMOUNT = os.getenv("GAME_PRIZE_AMOUNT", "5000000000")
-REFERRAL_PRIZE_AMOUNT = os.getenv("REFERRAL_PRIZE_AMOUNT", "2000000000")
+GAME_PRIZE_AMOUNT = os.getenv("GAME_PRIZE_AMOUNT", "5000000000")  # 5 billion NFZ default
+REFERRAL_PRIZE_AMOUNT = os.getenv("REFERRAL_PRIZE_AMOUNT", "2000000000")  # 2 billion NFZ default
 
 DATA_FILE = "data.json"
 
@@ -32,6 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Try to set up web3 for automatic sending (optional feature)
 w3 = None
 sender_account = None
 AUTO_SEND_ENABLED = False
@@ -47,7 +49,7 @@ if WALLET_PRIVATE_KEY:
         logger.error(f"Failed to set up web3 auto-send: {e}")
         AUTO_SEND_ENABLED = False
 else:
-    logger.info("WALLET_PRIVATE_KEY not set. Manual mode.")
+    logger.info("WALLET_PRIVATE_KEY not set. Automatic prize sending is DISABLED (manual mode).")
 
 ERC20_ABI = [
     {
@@ -164,12 +166,19 @@ def main_keyboard():
 
 
 def send_token_reward(to_address: str, amount_tokens: int) -> tuple:
+    """
+    Sends NFZ tokens automatically from the prize wallet.
+    Returns (success: bool, message: str).
+    Only works if WALLET_PRIVATE_KEY is configured in environment variables.
+    """
     if not AUTO_SEND_ENABLED:
-        return False, "Automatic sending is not configured."
+        return False, "Automatic sending is not configured (no private key set)."
+
     try:
         contract = w3.eth.contract(address=Web3.to_checksum_address(TOKEN_ADDRESS), abi=ERC20_ABI)
         decimals = contract.functions.decimals().call()
         amount_wei = int(amount_tokens * (10 ** decimals))
+
         nonce = w3.eth.get_transaction_count(sender_account.address)
         txn = contract.functions.transfer(
             Web3.to_checksum_address(to_address), amount_wei
@@ -184,7 +193,10 @@ def send_token_reward(to_address: str, amount_tokens: int) -> tuple:
         return True, tx_hash.hex()
     except Exception as e:
         logger.error(f"Token send error: {e}")
-        return False, str(e)async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        return False, str(e)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     data = load_data()
 
@@ -199,7 +211,7 @@ def send_token_reward(to_address: str, amount_tokens: int) -> tuple:
                 try:
                     await context.bot.send_message(
                         chat_id=int(ref_id),
-                        text="A new user joined using your referral link! Use /wallet to set your BSC address."
+                        text="A new user joined using your referral link! Use /wallet to set your BSC address and receive your bonus."
                     )
                 except Exception:
                     pass
@@ -220,13 +232,13 @@ async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     address = context.args[0]
     if not address.startswith("0x") or len(address) != 42:
-        await update.message.reply_text("Invalid address format.")
+        await update.message.reply_text("That doesn't look like a valid BSC address (must start with 0x and be 42 characters).")
         return
     data = load_data()
     data.setdefault("wallets", {})
     data["wallets"][user_id] = address
     save_data(data)
-    await update.message.reply_text(f"Wallet saved: {address}")
+    await update.message.reply_text(f"Wallet saved: {address}\nPrizes will be sent here automatically (if auto-send is enabled) or manually by the admin.")
 
 
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,7 +260,9 @@ async def holders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["game_number"] = random.randint(1, 10)
-    await update.message.reply_text("I picked a number from 1 to 10! Type a number to guess.")
+    await update.message.reply_text(
+        "I picked a number from 1 to 10! Type a number in chat to guess."
+    )
 
 
 async def guess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -276,30 +290,33 @@ async def guess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success, result = send_token_reward(wallet, amount)
             if success:
                 await update.message.reply_text(
-                    f"You guessed it! Number was {target}.\n{amount:,} NFZ sent!\nTx: {result}"
+                    f"You guessed it! The number was {target}.\n"
+                    f"{amount:,} NFZ sent automatically!\nTx: {result}"
                 )
             else:
                 await update.message.reply_text(
-                    f"You guessed it! Number was {target}.\nAuto-send failed. Admin will send manually."
+                    f"You guessed it! The number was {target}.\n"
+                    f"Automatic send failed ({result}). Admin will send manually."
                 )
                 if ADMIN_ID:
                     try:
                         await context.bot.send_message(
                             chat_id=int(ADMIN_ID),
-                            text=f"AUTO-SEND FAILED for @{username} ({user_id}), wallet: {wallet}"
+                            text=f"AUTO-SEND FAILED for game winner @{username} (id: {user_id}), wallet: {wallet}. Please send manually."
                         )
                     except Exception:
                         pass
         else:
             await update.message.reply_text(
-                f"You guessed it! Number was {target}.\nPrize sent manually by admin."
-                + ("" if wallet else "\nSet your wallet with /wallet 0xYourAddress")
+                f"You guessed it! The number was {target}.\n"
+                f"The prize will be sent manually by the administrator."
+                + ("" if wallet else "\nSet your wallet first with /wallet 0xYourAddress")
             )
             if ADMIN_ID:
                 try:
                     await context.bot.send_message(
                         chat_id=int(ADMIN_ID),
-                        text=f"Game winner: @{username} ({user_id}), wallet: {wallet or 'NOT SET'}"
+                        text=f"Game winner: @{username} (id: {user_id}), wallet: {wallet or 'NOT SET'}. Please send the prize manually."
                     )
                 except Exception:
                     pass
@@ -316,7 +333,9 @@ async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     count = data["referrals"].get(user_id, {}).get("count", 0)
     await update.message.reply_text(
-        f"Your referral link:\n{link}\n\nInvited: *{count}*\nRegister wallet with /wallet 0xAddress",
+        f"Your referral link:\n{link}\n\n"
+        f"Friends invited: *{count}*\n"
+        f"You get a bonus in NFZ for each friend. Register your wallet with /wallet 0xYourAddress",
         parse_mode="Markdown",
     )
 
@@ -324,18 +343,18 @@ async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if user_id != ADMIN_ID:
-        await update.message.reply_text("Admin only command.")
+        await update.message.reply_text("This command is available to the administrator only.")
         return
     if not CHANNEL_ID:
-        await update.message.reply_text("CHANNEL_ID not set.")
+        await update.message.reply_text("CHANNEL_ID is not set.")
         return
     text = " ".join(context.args)
     if not text:
-        await update.message.reply_text("Usage: /post your text")
+        await update.message.reply_text("Usage: /post your message text")
         return
     try:
         await context.bot.send_message(chat_id=CHANNEL_ID, text=text)
-        await update.message.reply_text("Posted.")
+        await update.message.reply_text("Posted to the channel.")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -371,7 +390,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data_cb == "cmd:play":
         context.user_data["game_number"] = random.randint(1, 10)
-        await query.message.reply_text("I picked a number from 1 to 10! Type a number.")
+        await query.message.reply_text("I picked a number from 1 to 10! Type a number in chat.")
 
     elif data_cb == "cmd:ref":
         user_id = str(query.from_user.id)
@@ -379,7 +398,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         link = f"https://t.me/{bot_username}?start={user_id}"
         data_store = load_data()
         count = data_store["referrals"].get(user_id, {}).get("count", 0)
-        await query.message.reply_text(f"Your link:\n{link}\n\nInvited: *{count}*", parse_mode="Markdown")
+        await query.message.reply_text(
+            f"Your referral link:\n{link}\n\nInvited: *{count}*",
+            parse_mode="Markdown",
+        )
 
 
 async def periodic_update(context: ContextTypes.DEFAULT_TYPE):
